@@ -2,7 +2,7 @@
 #d: Install open-source NVIDIA drivers
 
 set -euo pipefail
-shopt -s extglob nullglob
+shopt -s nullglob
 
 # --- 2. GLOBAL STATE ---
 HAS_INTEL=0
@@ -57,7 +57,11 @@ detect_topology() {
     log_info "Scanning GPU Topology..."
     
     # --- PHASE 1: Sysfs (Preferred - Active GPUs) ---
-    for card_path in /sys/class/drm/card+([0-9]); do
+    # NOTE: portable glob (no extglob) so `sh`/`bash -n`/shellcheck don't choke on `+()`.
+    for card_path in /sys/class/drm/card[0-9]*; do
+        # Skip literal non-match (no nullglob in sh) and connectors like card0-DP-1
+        [[ -e "$card_path" ]] || continue
+        [[ "$(basename "$card_path")" =~ ^card[0-9]+$ ]] || continue
         local vendor_file="$card_path/device/vendor"
         [[ ! -r "$vendor_file" ]] && continue
         

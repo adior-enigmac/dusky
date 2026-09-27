@@ -66,6 +66,14 @@ READ_ONLY_STATE_HELP = {
 
 # --- DETAILED EXTENDED HELP DICTIONARIES ---
 CORE_USER_DEFS = {
+    "dusky_vnc.service": (
+        "VNC Remote Desktop",
+        "WayVNC control of the active Hyprland desktop over local Wi-Fi or iPhone USB tethering. The switch enables and starts the server, or disables and stops it.",
+    ),
+    "dusky_phone_display.service": (
+        "Phone Secondary Display",
+        "Creates a landscape Hyprland monitor for a phone and serves it with WayVNC on port 5901. Disabling stops the server and removes the virtual monitor.",
+    ),
     "app-dev.lizardbyte.app.Sunshine.service": (
         "Sunshine Streaming",
         "Self-hosted game stream host for Moonlight. Streams your desktop and games to Moonlight clients. Runs as a user service and is enabled to start automatically with your graphical session (graphical-session.target). Use systemctl --user disable to stop it launching at login, or disable/enable right here.",
@@ -278,6 +286,7 @@ CORE_USER_SECTIONS = (
     ("Desktop & Session", (
         "hyprsunset.service", "hypridle.service", "osd_lock.service",
         "dusky_polkit.service", "dusky_clipboard.service", "dusky-oom-shield.service",
+        "dusky_vnc.service", "dusky_phone_display.service",
     )),
     ("Panels & Integration", (
         "dusky.service", "dusky_quickpanal.service", "network_meter.service",

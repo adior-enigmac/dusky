@@ -9,11 +9,32 @@ mod ui;
 
 use config::Config;
 use std::env;
-use ui::WallpaperSelectorApp;
+use ui::DuskyPapersApp;
+
+// Bound background task threads instead of creating one for every CPU.
+struct BackgroundExecutor(iced_futures::futures::executor::ThreadPool);
+
+impl iced_futures::Executor for BackgroundExecutor {
+    fn new() -> Result<Self, iced_futures::futures::io::Error> {
+        iced_futures::futures::executor::ThreadPool::builder()
+            .pool_size(2)
+            .name_prefix("wallpaper-worker")
+            .create()
+            .map(Self)
+    }
+
+    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.0.spawn_ok(future);
+    }
+
+    fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        iced_futures::futures::executor::block_on(future)
+    }
+}
 
 fn print_help() {
-    println!("Dusky Wallpaper Selector (Rust/Iced)");
-    println!("Usage: wallpaper_selector [OPTIONS]\n");
+    println!("Dusky Papers");
+    println!("Usage: dusky-papers [OPTIONS]\n");
     println!("Options:");
     println!("  --next-fav       Cycle to next favorite wallpaper and exit");
     println!("  --prev-fav       Cycle to previous favorite wallpaper and exit");
@@ -55,7 +76,7 @@ fn cycle_favorite(direction_next: bool, config: &Config) -> bool {
         let _ = std::process::Command::new("notify-send")
             .args([
                 "-a",
-                "dusky-wallpaper",
+                "dusky-papers",
                 "No Favorites",
                 "No favorite wallpapers found.",
             ])
@@ -179,7 +200,7 @@ impl SingleInstanceGuard {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(std::path::PathBuf::from)
             .ok_or("XDG_RUNTIME_DIR is not set")?;
-        let path = runtime_dir.join("dusky_wallpaper_selector.lock");
+        let path = runtime_dir.join("dusky-papers.lock");
         let file = std::fs::File::create(&path)
             .map_err(|e| format!("Could not open {}: {e}", path.display()))?;
         match file.try_lock() {
@@ -188,64 +209,6 @@ impl SingleInstanceGuard {
             Err(error) => Err(format!("Could not lock {}: {error}", path.display())),
         }
     }
-}
-
-fn hyprctl_json(command: &str) -> Option<serde_json::Value> {
-    let output = std::process::Command::new("hyprctl")
-        .args([command, "-j"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| serde_json::from_slice(&output.stdout).ok())?
-}
-
-fn reveal_existing_window() -> Result<(), String> {
-    let workspace = hyprctl_json("activeworkspace")
-        .and_then(|value| value["name"].as_str().map(str::to_owned))
-        .ok_or("Could not determine the current Hyprland workspace")?;
-    let clients = hyprctl_json("clients").ok_or("Could not query Hyprland windows")?;
-    let window = clients
-        .as_array()
-        .and_then(|clients| {
-            clients
-                .iter()
-                .find(|client| client["class"].as_str() == Some("dusky-wallpaper-selector-rust"))
-        })
-        .ok_or("Could not find the running wallpaper selector window")?;
-    let address = window["address"]
-        .as_str()
-        .ok_or("Hyprland did not report a window address")?;
-    let window_address = format!("address:{address}");
-
-    if window["workspace"]["name"].as_str() != Some(workspace.as_str()) {
-        let expression = format!(
-            "hl.dsp.window.move({{ window = {}, workspace = {}, follow = false }})",
-            serde_json::to_string(&window_address).map_err(|e| e.to_string())?,
-            serde_json::to_string(&workspace).map_err(|e| e.to_string())?,
-        );
-        let result = std::process::Command::new("hyprctl")
-            .args(["dispatch", &expression])
-            .output()
-            .map_err(|e| format!("Could not move the selector: {e}"))?;
-        if !result.status.success() {
-            return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
-        }
-    }
-
-    let expression = format!(
-        "hl.dsp.focus({{ window = {} }})",
-        serde_json::to_string(&window_address).map_err(|e| e.to_string())?,
-    );
-    let result = std::process::Command::new("hyprctl")
-        .args(["dispatch", &expression])
-        .output()
-        .map_err(|e| format!("Could not focus the selector: {e}"))?;
-    if !result.status.success() {
-        return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
-    }
-    Ok(())
 }
 
 fn read_card_vendor_driver(card_name: &str) -> Option<(String, String)> {
@@ -315,6 +278,11 @@ fn detect_primary_gpu_vendor() -> Option<(String, String)> {
 }
 
 fn optimize_gpu_environment() {
+    // Avoid initializing unused graphics backends on this Vulkan/Wayland target.
+    // An explicit user override still takes precedence.
+    if env::var_os("WGPU_BACKEND").is_none() {
+        unsafe { env::set_var("WGPU_BACKEND", "vulkan") };
+    }
     // 1. If user explicitly provided driver files, don't override
     if env::var_os("VK_DRIVER_FILES").is_some() {
         return;
@@ -384,7 +352,7 @@ fn optimize_gpu_environment() {
     }
 }
 
-fn main() -> iced::Result {
+fn main() -> iced_exwlshell::Result {
     let config = Config::load();
     let args: Vec<String> = env::args().collect();
 
@@ -400,7 +368,7 @@ fn main() -> iced::Result {
     }
 
     if matches!(option, Some("--version" | "-v" | "-V")) {
-        println!("wallpaper_selector {}", env!("CARGO_PKG_VERSION"));
+        println!("dusky-papers {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -442,55 +410,58 @@ fn main() -> iced::Result {
     // Single-instance guard prevents duplicate instances and CPU thrashing
     let _guard = match SingleInstanceGuard::acquire() {
         Ok(Some(g)) => g,
-        Ok(None) => {
-            if let Err(error) = reveal_existing_window() {
-                eprintln!("Could not show the running wallpaper selector: {error}");
-            }
-            return Ok(());
-        }
+        // The existing overlay already covers its monitor, across workspaces.
+        Ok(None) => return Ok(()),
         Err(error) => {
-            eprintln!("Could not start wallpaper selector: {error}");
+            eprintln!("Could not start Dusky Papers: {error}");
             std::process::exit(1);
         }
     };
 
     optimize_gpu_environment();
-    // Launch GUI in transparent overlay mode (matching skwd-wall overlay)
-    let window_settings = iced::window::Settings {
-        decorations: false,
-        transparent: true,
-        platform_specific: iced::window::settings::PlatformSpecific {
-            application_id: "dusky-wallpaper-selector-rust".to_string(),
+    // Cover the active output without entering native fullscreen or hiding its windows.
+    let settings = iced_exwlshell::Settings {
+        layer_settings: iced_exwlshell::settings::LayerShellSettings {
+            layer: iced_exwlshell::reexport::Layer::Overlay,
+            blur_option: iced_exwlshell::reexport::BlurOption::FullRegion,
+            keyboard_interactivity: iced_exwlshell::reexport::KeyboardInteractivity::Exclusive,
             ..Default::default()
         },
+        keep_compositor_alive: false,
         ..Default::default()
     };
 
     let app_config = config.clone();
-    iced::application(
-        move || WallpaperSelectorApp::new(app_config.clone()),
-        WallpaperSelectorApp::update,
-        WallpaperSelectorApp::view,
+    iced_exwlshell::layershell::application(
+        move || DuskyPapersApp::new(app_config.clone()),
+        "dusky-papers",
+        DuskyPapersApp::update,
+        DuskyPapersApp::view,
     )
-    .window(window_settings)
-    .subscription(WallpaperSelectorApp::subscription)
+    .executor::<BackgroundExecutor>()
+    .settings(settings)
+    .subscription(DuskyPapersApp::subscription)
     .theme(theme)
     .style(style)
-    .title(title)
     .run()
 }
 
-fn style(_: &WallpaperSelectorApp, theme: &iced::Theme) -> iced::theme::Style {
-    iced::theme::Style {
-        background_color: iced::Color::TRANSPARENT,
+fn style(_: &DuskyPapersApp, theme: &iced_core::Theme) -> iced_core::theme::Style {
+    iced_core::theme::Style {
+        background_color: iced_core::Color::from_rgba(0.06, 0.07, 0.09, 0.15),
         text_color: theme.palette().text,
     }
 }
 
-fn title(_: &WallpaperSelectorApp) -> String {
-    "Wallpaper Selector".to_string()
+fn theme(_: &DuskyPapersApp) -> iced_core::Theme {
+    iced_core::Theme::Dark
 }
 
-fn theme(_: &WallpaperSelectorApp) -> iced::Theme {
-    iced::Theme::Dark
+// UI messages are ordinary Iced messages, with no layer reconfiguration actions.
+impl TryInto<iced_exwlshell::actions::ExwlShellCustomActionWithId> for ui::Message {
+    type Error = Self;
+
+    fn try_into(self) -> Result<iced_exwlshell::actions::ExwlShellCustomActionWithId, Self> {
+        Err(self)
+    }
 }

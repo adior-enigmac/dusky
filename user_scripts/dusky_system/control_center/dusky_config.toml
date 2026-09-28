@@ -1630,6 +1630,39 @@ type = "exec"
 command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/network_manager/tui_dns.py"
 
 
+[[pages.layout]]
+type = "section"
+[pages.layout.properties]
+title = "Firewall & Security"
+icon = ""
+description = ""
+
+[[pages.layout.items]]
+type = "button"
+[pages.layout.items.properties]
+title = "Firewall (UFW)"
+description = "Bleeding-edge UFW rules, open/closed ports, NAT & domain lockdown"
+icon = "security-high-symbolic"
+
+[[pages.layout.items.properties.buttons]]
+icon = "document-edit-symbolic"
+[pages.layout.items.properties.buttons.on_press]
+type = "exec"
+command = "$HOME/user_scripts/dusky_system/control_center/dusky_text_editor.py \"/etc/default/ufw\""
+
+[[pages.layout.items.properties.buttons]]
+icon = "security-high-symbolic"
+style = "suggested"
+[pages.layout.items.properties.buttons.on_press]
+type = "exec"
+command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/network_manager/tui_ufw.py"
+
+[pages.layout.items.on_press]
+type = "exec"
+command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/network_manager/tui_ufw.py"
+terminal = false
+
+
 [[pages]]
 id = "hardware"
 title = "Hardware"

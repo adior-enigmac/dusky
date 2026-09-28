@@ -160,7 +160,7 @@ impl Config {
             .expect("Could not determine the user's home directory");
 
         let wallpaper_dir = home.join("Pictures/wallpapers");
-        let cache_dir = home.join(".cache/dusky_images/wallpaper_selector_rust");
+        let cache_dir = home.join(".cache/dusky_images/dusky_papers");
         let thumb_dir = cache_dir.join("thumbs");
         let colors_file = cache_dir.join("colors.json");
         let theme_dir = home.join(".config/dusky/settings/dusky_theme");
@@ -169,8 +169,7 @@ impl Config {
         let track_dark = theme_dir.join("dark_wal");
         let track_light = theme_dir.join("light_wal");
         let theme_ctl = home.join("user_scripts/theme_matugen/theme_ctl.sh");
-        let preferences_file =
-            home.join(".config/dusky/settings/wallpaper_selector_rust/preferences.json");
+        let preferences_file = home.join(".config/dusky/settings/dusky_papers/preferences.json");
 
         Self {
             home,

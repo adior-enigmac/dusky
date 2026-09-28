@@ -132,7 +132,7 @@ class SystemdEngine(BaseEngine):
             except (OSError, RuntimeError, subprocess.TimeoutExpired):
                 actual = None
             if res.returncode == 0 and actual in (None, value):
-                return UnitWriteResult(True, f"{action.capitalize()}d {key}", actual or value)
+                return UnitWriteResult(True, f"{action.capitalize()}d {key}", actual)
             if res.returncode == 0:
                 return UnitWriteResult(False, f"{action} --now {key} did not change enablement", actual)
             if scope == "system" and self._auth_required(error):
@@ -147,9 +147,15 @@ class SystemdEngine(BaseEngine):
                 actual = ("true" if after in ENABLED_STATES else "false") if after else None
             except (OSError, RuntimeError, subprocess.TimeoutExpired):
                 actual = None
-            return UnitWriteResult(False, f"Timed out changing {key}; enablement was rechecked", actual)
+            detail = "enablement was rechecked" if actual is not None else "enablement could not be verified"
+            return UnitWriteResult(False, f"Timed out changing {key}; {detail}", actual)
         except (OSError, RuntimeError, ValueError) as exc:
-            return UnitWriteResult(False, f"Could not change {key}: {exc}", None)
+            try:
+                after = self.list_unit_files(scope, [key]).get(key)
+                actual = ("true" if after in ENABLED_STATES else "false") if after else None
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+                actual = None
+            return UnitWriteResult(False, f"Could not change {key}: {exc}", actual)
 
     def write_value(self, target_key: str, target_scope: str, new_value: str,
                     item_type: str = "bool") -> tuple[bool, str, str]:
@@ -162,6 +168,9 @@ class SystemdEngine(BaseEngine):
         for key, scope, value, _ in changes:
             requested[(key, scope)] = value
         results = {}
+        for key, scope in requested:
+            if scope not in {"user", "system"}:
+                results[(key, scope)] = UnitWriteResult(False, f"Invalid systemd scope: {scope!r}", None)
         for scope in ("user", "system"):
             units = [key for key, unit_scope in requested if unit_scope == scope]
             if not units:
@@ -220,7 +229,7 @@ class SystemdEngine(BaseEngine):
                     elif actual is not None and actual != desired:
                         results[(key, scope)] = UnitWriteResult(False, f"{action} --now {key} did not change enablement", actual)
                     else:
-                        results[(key, scope)] = UnitWriteResult(True, f"{action.capitalize()}d {key}", actual or desired)
+                        results[(key, scope)] = UnitWriteResult(True, f"{action.capitalize()}d {key}", actual)
         return results
 
     def write_batch(self, changes: list[tuple[str, str, str, str]]) -> tuple[bool, str, str]:

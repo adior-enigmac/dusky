@@ -72,11 +72,15 @@ CORE_USER_DEFS = {
     ),
     "dusky_phone_display.service": (
         "Phone Secondary Display",
-        "Creates a landscape Hyprland monitor for a phone and serves it with WayVNC on port 5901. Disabling stops the server and removes the virtual monitor.",
+        "Creates a landscape or portrait Hyprland monitor for a phone and serves it with WayVNC on port 5901. Set orientation with phone_display.py orientation portrait|landscape. Disabling stops the server and removes the virtual monitor.",
+    ),
+    "dusky_moonlight_display.service": (
+        "Moonlight Secondary Display",
+        "Creates its own landscape or portrait Hyprland monitor and streams it through Sunshine to Moonlight. Set orientation with moonlight_setup.py orientation portrait|landscape. Disabling stops Sunshine and removes this monitor.",
     ),
     "app-dev.lizardbyte.app.Sunshine.service": (
-        "Sunshine Streaming",
-        "Self-hosted game stream host for Moonlight. Streams your desktop and games to Moonlight clients. Runs as a user service and is enabled to start automatically with your graphical session (graphical-session.target). Use systemctl --user disable to stop it launching at login, or disable/enable right here.",
+        "Sunshine Default Service",
+        "Streams the default desktop through Sunshine. It uses the same Moonlight ports as Moonlight Secondary Display, so run only one of these Sunshine services at a time.",
     ),
     "hyprsunset.service": (
         "Night Light",
@@ -286,7 +290,7 @@ CORE_USER_SECTIONS = (
     ("Desktop & Session", (
         "hyprsunset.service", "hypridle.service", "osd_lock.service",
         "dusky_polkit.service", "dusky_clipboard.service", "dusky-oom-shield.service",
-        "dusky_vnc.service", "dusky_phone_display.service",
+        "dusky_vnc.service", "dusky_phone_display.service", "dusky_moonlight_display.service",
     )),
     ("Panels & Integration", (
         "dusky.service", "dusky_quickpanal.service", "network_meter.service",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Use a current ISO package or build the selector for this CPU."""
+"""Use a current ISO package or build Dusky Papers for this CPU."""
 
 import argparse
 import hashlib
@@ -19,8 +19,8 @@ from pathlib import Path
 
 GIB = 1024 ** 3
 TARGET = "x86_64-unknown-linux-gnu"
-SYSTEM_BINARY = Path("/usr/bin/dusky-wallpaper-selector")
-SYSTEM_SOURCE_DIGEST = Path("/usr/share/dusky-wallpaper-selector/source.sha256")
+SYSTEM_BINARY = Path("/usr/bin/dusky-papers")
+SYSTEM_SOURCE_DIGEST = Path("/usr/share/dusky-papers/source.sha256")
 
 
 def env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 3600) -> int:
@@ -35,9 +35,9 @@ def env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 3600) -
 
 
 BUILD_RECIPE = "native-v3-frozen-sparse"
-FETCH_TIMEOUT_S = env_int("DUSKY_WALLPAPER_FETCH_TIMEOUT", 120, maximum=1800)
-BUILD_TIMEOUT_S = env_int("DUSKY_WALLPAPER_BUILD_TIMEOUT", 7200, maximum=7200)
-CACHE_TIMEOUT_S = env_int("DUSKY_WALLPAPER_CACHE_TIMEOUT", 120, maximum=900)
+FETCH_TIMEOUT_S = env_int("DUSKY_PAPERS_FETCH_TIMEOUT", 120, maximum=1800)
+BUILD_TIMEOUT_S = env_int("DUSKY_PAPERS_BUILD_TIMEOUT", 7200, maximum=7200)
+CACHE_TIMEOUT_S = env_int("DUSKY_PAPERS_CACHE_TIMEOUT", 120, maximum=900)
 
 
 def log(level: str, message: str) -> None:
@@ -97,7 +97,7 @@ def binary_runs(binary: Path) -> bool:
             timeout=10,
             check=False,
         )
-        return result.returncode == 0 and "wallpaper_selector" in result.stdout
+        return result.returncode == 0 and "dusky-papers" in result.stdout
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -235,7 +235,7 @@ def build_base() -> tuple[Path, bool]:
                 log("INFO", f"Building in memory at {path}")
                 return path, True
     log("INFO", "Building on disk; temporary build files will be removed")
-    disk_base = Path.home() / ".cache/dusky/wallpaper_selector_builds"
+    disk_base = Path.home() / ".cache/dusky/dusky_papers_builds"
     disk_base.mkdir(parents=True, exist_ok=True)
     return disk_base, False
 
@@ -417,7 +417,7 @@ def build_native(project: Path, binary: Path, manifest_path: Path, version: str)
         return False
 
     base, ram_build = build_base()
-    with tempfile.TemporaryDirectory(prefix="dusky-wall-build-", dir=base) as temp:
+    with tempfile.TemporaryDirectory(prefix="dusky-papers-build-", dir=base) as temp:
         temp_dir = Path(temp)
         target_dir = temp_dir / "target"
         cargo_home = get_cargo_home(temp_dir)
@@ -465,7 +465,7 @@ def build_native(project: Path, binary: Path, manifest_path: Path, version: str)
             log("WARN", f"Cargo build failed:\n{stderr[-12000:]}")
             return False
 
-        built = target_dir / TARGET / "release" / "wallpaper_selector"
+        built = target_dir / TARGET / "release" / "dusky-papers"
         if not binary_runs(built):
             log("WARN", "Built binary failed its executable smoke test")
             return False
@@ -497,18 +497,18 @@ def build_native(project: Path, binary: Path, manifest_path: Path, version: str)
 
 def main(argv: list[str] | None = None) -> int:
     home = Path.home()
-    project = home / "user_scripts/images/wallpaper_selector"
+    project = home / "user_scripts/images/dusky_papers"
     source_available = (project / "Cargo.toml").is_file()
     try:
         project_ver = get_project_version(project) if source_available else None
     except (OSError, KeyError, tomllib.TOMLDecodeError) as error:
-        log("WARN", f"Could not read selector package version; skipping setup: {error}")
+        log("WARN", f"Could not read Dusky Papers package version; skipping setup: {error}")
         return 0
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--version", "-v", action="version",
-        version=f"wallpaper_selector_setup {project_ver or 'package-only'}",
+        version=f"dusky_papers_setup {project_ver or 'package-only'}",
         help="Show version information and exit",
     )
     cache_group = parser.add_mutually_exclusive_group()
@@ -522,21 +522,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    install_dir = home / ".local/share/dusky/wallpaper_selector"
-    binary = install_dir / "wallpaper_selector"
+    install_dir = home / ".local/share/dusky/dusky_papers"
+    binary = install_dir / "dusky-papers"
     manifest_path = install_dir / "binary_manifest.json"
-    local_bin = home / ".local/bin/wallpaper_selector"
-    thumb_dir = home / ".cache/dusky_images/wallpaper_selector_rust/thumbs"
+    local_bin = home / ".local/bin/dusky-papers"
+    thumb_dir = home / ".cache/dusky_images/dusky_papers/thumbs"
     settings_dir = home / ".config/dusky/settings/dusky_theme"
 
     if platform.machine() != "x86_64":
-        log("WARN", "This selector package targets x86-64 only; skipping setup")
+        log("WARN", "This Dusky Papers package targets x86-64 only; skipping setup")
         return 0
     try:
         for directory in (thumb_dir, settings_dir, install_dir, local_bin.parent):
             directory.mkdir(parents=True, exist_ok=True)
     except OSError as error:
-        log("WARN", f"Could not prepare selector directories; skipping setup: {error}")
+        log("WARN", f"Could not prepare Dusky Papers directories; skipping setup: {error}")
         return 0
 
     system_ok = binary_runs(SYSTEM_BINARY)
@@ -594,7 +594,7 @@ def main(argv: list[str] | None = None) -> int:
             selected = True
 
     if not selected:
-        log("WARN", "No runnable packaged or native selector binary is available; skipping setup")
+        log("WARN", "No runnable packaged or native Dusky Papers binary is available; skipping setup")
         return 0
 
     if binary_runs(binary):
@@ -608,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
             log("WARN", f"Could not create launcher symlink: {error}")
             return 0
     else:
-        log("WARN", "No runnable wallpaper selector binary available; skipping launcher symlink")
+        log("WARN", "No runnable Dusky Papers binary available; skipping launcher symlink")
         return 0
 
     cache_mode = "--rebuild-cache" if args.rebuild_cache else "--build-cache"
@@ -624,13 +624,15 @@ def main(argv: list[str] | None = None) -> int:
     if returncode != 0:
         log("WARN", f"Thumbnail generation failed (exit {returncode}); continuing update")
         return 0
-    log("OK", "Wallpaper selector setup complete")
+    log("OK", "Dusky Papers setup complete")
     return 0
 
 
 if __name__ == "__main__":
+    # Unwind runner and TemporaryDirectory cleanup on service/updater cancellation.
+    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
     try:
         sys.exit(main())
     except Exception as error:
-        log("WARN", f"Wallpaper selector setup failed; continuing update: {error}")
+        log("WARN", f"Dusky Papers setup failed; continuing update: {error}")
         sys.exit(0)

@@ -1,4 +1,4 @@
-use iced::Color;
+use iced_core::Color;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;

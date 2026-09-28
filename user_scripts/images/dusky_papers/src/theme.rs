@@ -1,4 +1,4 @@
-use iced::Color;
+use iced_core::Color;
 use std::fs;
 use std::path::PathBuf;
 

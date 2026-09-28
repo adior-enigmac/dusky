@@ -98,6 +98,11 @@ pub fn read_active_wallpaper(theme_dir: &Path) -> Option<String> {
             return Some(path);
         }
     }
+    read_tracked_wallpaper(theme_dir)
+}
+
+/// Read controller state without waiting for a wallpaper-daemon round trip.
+pub fn read_tracked_wallpaper(theme_dir: &Path) -> Option<String> {
     if let Ok(record) = fs::read(theme_dir.join("current_image")) {
         if let Some(path) = record.split(|&byte| byte == 0).next()
             && let Ok(path) = std::str::from_utf8(path)

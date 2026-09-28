@@ -97,7 +97,7 @@ THUMB_DIR = CACHE_DIR / "thumbs"
 # Lock files must remain outside the directory being swept.
 CACHE_LOCK_FILE = CACHE_DIR / "cache.lock"
 APPLY_LOCK_FILE = CACHE_DIR / "apply.lock"
-FAVORITES_LOCK_FILE = CACHE_DIR / "favorites.lock"
+FAVORITES_LOCK_FILE = THEME_DIR / "favorites.lock"
 
 TRACKER_ID_FORMAT = "basename"  # "basename" or "relative"
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Use a phone as a separate Hyprland display through WayVNC on port 5901."""
+"""Use a phone as a separate Hyprland display through WayVNC on port 5901.
+
+Run ``orientation portrait`` or ``orientation landscape`` to switch its shape.
+"""
 
 import argparse
 import ipaddress
@@ -27,11 +30,37 @@ STATE = RUNTIME / "dusky-phone-display.json"
 CONTROL = RUNTIME / "dusky-phone-wayvnc.sock"
 OUTPUT = "DUSKY-PHONE"
 PORT = 5901
-WIDTH, HEIGHT = 1280, 720
+LANDSCAPE_SIZE = (1280, 720)
+PREFERENCES = HOME / ".config/dusky/settings/remote/vnc_display.json"
 
 
 def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, text=True, capture_output=True, check=check)
+
+
+def save_preferences(values: dict) -> None:
+    PREFERENCES.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PREFERENCES.parent) as directory:
+        replacement = Path(directory) / PREFERENCES.name
+        replacement.write_text(json.dumps(values, indent=2) + "\n")
+        replacement.replace(PREFERENCES)
+
+
+def preferences() -> dict:
+    if not PREFERENCES.exists():
+        save_preferences({"orientation": "landscape"})
+    try:
+        values = json.loads(PREFERENCES.read_text())
+    except ValueError as error:
+        raise RuntimeError(f"Invalid JSON in {PREFERENCES}: {error}") from error
+    if not isinstance(values, dict) or values.get("orientation") not in {"landscape", "portrait"}:
+        raise RuntimeError(f"Set orientation to landscape or portrait in {PREFERENCES}")
+    return values
+
+
+def display_size(value: str | None = None) -> tuple[int, int]:
+    width, height = LANDSCAPE_SIZE
+    return (width, height) if (value or preferences()["orientation"]) == "landscape" else (height, width)
 
 
 def hypr(instance: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -95,15 +124,19 @@ def write_config() -> bool:
 
 
 def unit_content() -> str:
-    relative = Path(__file__).resolve().relative_to(HOME).as_posix()
-    script = f"%h/{relative}"
+    try:
+        script = f"%h/{Path(__file__).resolve().relative_to(HOME).as_posix().replace('%', '%%')}"
+    except ValueError:
+        script = str(Path(__file__).resolve()).replace("%", "%%")
+    script = json.dumps(script, ensure_ascii=False)
+    python = json.dumps(sys.executable.replace("%", "%%"), ensure_ascii=False)
     return (
         "[Unit]\nDescription=Phone secondary display over WayVNC\n"
         "After=graphical-session.target\nPartOf=graphical-session.target\n"
         "StartLimitIntervalSec=0\n\n"
         "[Service]\nType=exec\n"
-        f"ExecStart=/usr/bin/python {script} serve\n"
-        f"ExecStopPost=/usr/bin/python {script} cleanup\n"
+        f"ExecStart={python} {script} serve\n"
+        f"ExecStopPost={python} {script} cleanup\n"
         "Restart=always\nRestartSec=2\n\n"
         "[Install]\nWantedBy=default.target graphical-session.target\n"
     )
@@ -134,9 +167,19 @@ def output_ready() -> bool:
         return False
 
 
+def display_ready() -> bool:
+    current = session()
+    if not current:
+        return False
+    width, height = display_size()
+    return any(item["name"] == OUTPUT and (item["width"], item["height"]) == (width, height)
+               for item in monitors(current["instance"]))
+
+
 def install() -> None:
     if os.geteuid() == 0:
         raise RuntimeError("Run setup as the desktop user, without sudo")
+    preferences()
     if not Path("/usr/bin/wayvnc").exists():
         print("Installing WayVNC from the distribution repository...")
         subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", "wayvnc"], check=True)
@@ -161,11 +204,11 @@ def install() -> None:
     active = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() == "active"
     if not active:
         run("systemctl", "--user", "start", UNIT_NAME)
-    elif config_changed or unit_changed or not (rfb_ready() and output_ready()):
+    elif config_changed or unit_changed or not (rfb_ready() and output_ready() and display_ready()):
         run("systemctl", "--user", "restart", UNIT_NAME)
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
-        if rfb_ready() and output_ready():
+        if rfb_ready() and output_ready() and display_ready():
             break
         time.sleep(0.2)
     status()
@@ -174,6 +217,7 @@ def install() -> None:
 def serve() -> None:
     if not CONFIG.is_file():
         raise RuntimeError("Run setup first")
+    width, height = display_size()
     while not (current := session()):
         time.sleep(2)
     instance = current["instance"]
@@ -186,12 +230,17 @@ def serve() -> None:
     STATE.write_text(json.dumps({"instance": instance}))
     try:
         hypr(instance, "output", "create", "headless", OUTPUT)
-        rule = (f'hl.monitor({{ output = "{OUTPUT}", mode = "{WIDTH}x{HEIGHT}@60", '
+        rule = (f'hl.monitor({{ output = "{OUTPUT}", mode = "{width}x{height}@60", '
                 'position = "auto-right", scale = 1, disabled = false })')
         hypr(instance, "eval", rule)
-        monitor = next((item for item in monitors(instance) if item["name"] == OUTPUT), None)
-        if not monitor or (monitor["width"], monitor["height"]) != (WIDTH, HEIGHT):
-            raise RuntimeError(f"Hyprland did not configure the {WIDTH}x{HEIGHT} phone output")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            monitor = next((item for item in monitors(instance) if item["name"] == OUTPUT), None)
+            if monitor and (monitor["width"], monitor["height"]) == (width, height):
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(f"Hyprland did not configure the {width}x{height} phone output")
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = str(RUNTIME)
         env["WAYLAND_DISPLAY"] = current["wl_socket"]
@@ -231,8 +280,11 @@ def addresses() -> list[str]:
 
 def status() -> None:
     active = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() == "active"
-    ready = rfb_ready() and output_ready()
+    ready = rfb_ready() and output_ready() and display_ready()
+    value = preferences()["orientation"]
+    width, height = display_size(value)
     print(f"Phone display: {'ready' if active and ready else 'off or starting'}")
+    print(f"Orientation: {value} ({width}x{height})")
     for address in addresses():
         print(address)
     if active and ready:
@@ -247,11 +299,42 @@ def stop() -> None:
     print("Phone display stopped; the virtual monitor was removed")
 
 
+def orientation(value: str | None) -> None:
+    current = preferences()
+    if value is None:
+        print(f"VNC display orientation: {current['orientation']} ({PREFERENCES})")
+        return
+    changed = value != current["orientation"]
+    if changed:
+        save_preferences({**current, "orientation": value})
+    width, height = display_size(value)
+    active = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() == "active"
+    applied = display_ready() if active else False
+    if active and (changed or not applied):
+        run("systemctl", "--user", "restart", UNIT_NAME)
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if rfb_ready() and output_ready() and display_ready():
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(f"Phone display did not start in {value}; check journalctl --user -u {UNIT_NAME}")
+    print(f"VNC display orientation: {value} ({width}x{height})")
+    print(f"Saved in {PREFERENCES}" + ("" if active else "; takes effect when the service starts"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("setup", "status", "serve", "cleanup", "stop"), default="setup")
-    {"setup": install, "status": status, "serve": serve, "cleanup": cleanup,
-     "stop": stop}[parser.parse_args().action]()
+    parser.add_argument("action", nargs="?", choices=("setup", "status", "serve", "cleanup", "stop", "orientation"), default="setup")
+    parser.add_argument("value", nargs="?", choices=("landscape", "portrait"), help="Display orientation for the orientation action")
+    args = parser.parse_args()
+    if args.action == "orientation":
+        orientation(args.value)
+    elif args.value:
+        parser.error("an orientation value requires the orientation action")
+    else:
+        {"setup": install, "status": status, "serve": serve, "cleanup": cleanup,
+         "stop": stop}[args.action]()
 
 
 if __name__ == "__main__":

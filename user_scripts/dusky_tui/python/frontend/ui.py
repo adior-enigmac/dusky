@@ -22,8 +22,10 @@ from textual import on, events, work
 from textual.message import Message
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, Horizontal
-from textual.geometry import Size
+from textual.containers import Vertical, Horizontal, VerticalScroll
+from textual.css.query import NoMatches
+from textual.geometry import Size, Region, Offset, Spacing
+from textual.layout import Layout, WidgetPlacement
 from textual.widgets import Label, Input, Tabs, Tab, ContentSwitcher, OptionList, Markdown, Static
 from textual.widgets.option_list import Option, OptionDoesNotExist
 from textual.screen import ModalScreen
@@ -1407,6 +1409,15 @@ class ConfigOptionList(OptionList):
     _last_click_x: int = 0
     _last_click_button: int = 1
 
+    def watch_highlighted(self, highlighted: int | None) -> None:
+        if getattr(self, "_restoring_options", False):
+            if highlighted is not None and not self.get_option_at_index(highlighted).disabled:
+                option = self.get_option_at_index(highlighted)
+                self._restored_option = option
+                self.post_message(self.OptionHighlighted(self, option, highlighted))
+            return
+        super().watch_highlighted(highlighted)
+
     def action_scroll_top(self) -> None:
         for i in range(self.option_count):
             if not self.get_option_at_index(i).disabled:
@@ -1515,6 +1526,24 @@ class ScrollIndicator(Label):
         txt.append("▼", style="bold")
 
         self.update(txt)
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        try:
+            tab_idx = int(self.id.split("-")[1])
+            ol = self.app.query_one(f"#list-{tab_idx}", ConfigOptionList)
+            ol.scroll_down(animate=False)
+            event.stop()
+        except Exception:
+            pass
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        try:
+            tab_idx = int(self.id.split("-")[1])
+            ol = self.app.query_one(f"#list-{tab_idx}", ConfigOptionList)
+            ol.scroll_up(animate=False)
+            event.stop()
+        except Exception:
+            pass
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
         if self._max_scroll_y <= 0:
@@ -1640,66 +1669,34 @@ class ModeButton(Label):
         await self.app.run_action("toggle_save_mode")
 
 
+class ShortcutFlowLayout(Layout):
+    """Arrange shortcut rows during layout, before the frame is painted."""
+    name = "shortcut_flow"
+
+    def arrange(self, parent, children, size, greedy=True):
+        placements = []
+        x = y = 0
+        for child in children:
+            width = min(size.width, child.get_content_width(size, parent.screen.size)
+                        + child.styles.gutter.width)
+            if x and x + width > size.width:
+                x = 0
+                y += 1
+            placements.append(WidgetPlacement(Region(x, y, width, 1), Offset(), Spacing(), child))
+            x += width
+        return placements
+
+
 class FlowContainer(Widget):
-    def on_mount(self) -> None:
-        self.styles.height = "auto"
-        self.styles.width = "100%"
-        self.call_after_refresh(self.reflow)
+    DEFAULT_CSS = "FlowContainer { height: auto; width: 100%; }"
 
-    def on_resize(self, event: events.Resize) -> None:
-        self.reflow()
+    @property
+    def layout(self):
+        return self._flow_layout
 
-    def reflow(self) -> None:
-        if not self.is_mounted:
-            return
-
-        width = self.size.width
-        if width <= 0:
-            return
-
-        visible_children = []
-
-        for child in self.children:
-            if not child.display:
-                continue
-
-            child.styles.position = "absolute"
-
-            cw = child.size.width
-            if cw <= 0:
-                rendered = child.render()
-                plain = rendered.plain if hasattr(rendered, "plain") else str(rendered)
-                cw = cell_len(plain) + 2
-
-            ch = child.size.height
-            if ch <= 0:
-                ch = 1
-
-            visible_children.append((child, cw, ch))
-
-        if not visible_children:
-            self.styles.height = 0
-            return
-
-        max_item_h = 1
-        for _, _, ch in visible_children:
-            max_item_h = max(max_item_h, ch)
-
-        x_offset = 0
-        y_offset = 0
-        gap = 2
-
-        for child, cw, ch in visible_children:
-            if x_offset + cw > width and x_offset > 0:
-                x_offset = 0
-                y_offset += max_item_h
-
-            child.styles.offset = (x_offset, y_offset)
-            x_offset += cw + gap
-
-        target_height = y_offset + max_item_h
-        if self.styles.height != target_height:
-            self.styles.height = target_height
+    def __init__(self, *args, **kwargs):
+        self._flow_layout = ShortcutFlowLayout()
+        super().__init__(*args, **kwargs)
 
 
 class AppFooter(Vertical):
@@ -1732,12 +1729,6 @@ class AppFooter(Vertical):
             yield ModeButton(id="footer-legend", classes="mode-btn")
             yield Label("", id="pos-counter", classes="pos-counter-btn")
             yield Label("", id="status-bar")
-
-    def on_resize(self, event: events.Resize) -> None:
-        try:
-            self.query_one(FlowContainer).reflow()
-        except Exception:
-            pass
 
     def watch_status_msg(self, new_val: str) -> None:
         try:
@@ -1809,60 +1800,110 @@ class CustomRichTabWidget(Static):
     DEFAULT_CSS = """
     CustomRichTabWidget {
         width: 100%;
-        height: 100%;
+        height: auto;
         background: transparent;
         padding: 0 1;
-        overflow-x: auto;
-        overflow-y: auto;
-        scrollbar-size: 1 1;
+        overflow: hidden hidden;
     }
     """
 
     def __init__(
-        self,
-        renderable_or_factory: Any,
-        app_ref: Any = None,
-        refresh_interval: float | None = None,
+        self, renderable_or_factory: Any, app_ref: Any = None,
+        refresh_interval: float | None = None, *, collector=None, prepare=None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(Text("Loading…", style="dim italic"), **kwargs)
         self.renderable_or_factory = renderable_or_factory
         self.app_ref = app_ref
         self.refresh_interval = refresh_interval
+        self.collector = collector
+        self.prepare = prepare
         self._refresh_timer: Timer | None = None
         self._refresh_inflight = False
+        self._refresh_task: asyncio.Task | None = None
+        self._refresh_pending = False
+        self._active = False
+        self._dirty = True
+        self._generation = 0
         self._factory_source = None
         self._factory_takes_app = False
-
-    def on_mount(self) -> None:
-        self.update_content()
-        if self.display:
-            self._start_timer()
+        self._last_rendered_repr: str | None = None
+        self._is_unmounted = False
+        self._collected_snapshot = None
 
     def on_unmount(self) -> None:
-        self._stop_timer()
+        self._is_unmounted = True
+        self.set_active(False)
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
 
-    def on_show(self) -> None:
-        self.update_content()
-        self._start_timer()
+    def set_active(self, active: bool) -> None:
+        if active == self._active:
+            return
+        self._active = active
+        if active:
+            if self._dirty or self.collector is None:
+                self.update_content()
+            self._start_timer()
+        else:
+            self._generation += 1
+            self._stop_timer()
 
-    def on_hide(self) -> None:
-        self._stop_timer()
+    def invalidate_content(self) -> None:
+        """Invalidate a retained snapshot after a model change or explicit refresh."""
+        self._dirty = True
+        self._generation += 1
+        if self._refresh_task is not None:
+            self._refresh_pending = True
 
     def _start_timer(self) -> None:
-        if self._refresh_timer is not None:
-            return
-        interval = self.refresh_interval
-        if interval is not None and interval > 0:
-            self._refresh_timer = self.set_interval(interval, self.update_content)
+        if self._refresh_timer is None and self._active:
+            interval = self.refresh_interval
+            if interval is not None and interval > 0:
+                self._refresh_timer = self.set_interval(interval, self._timer_tick)
 
     def _stop_timer(self) -> None:
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
             self._refresh_timer = None
 
+    def _timer_tick(self) -> None:
+        if self._active and not self._refresh_inflight:
+            self._request_refresh()
+
+    async def _async_refresh(self) -> None:
+        self._refresh_inflight = True
+        try:
+            while self._active and not self._is_unmounted:
+                self._refresh_pending = False
+                generation = self._generation
+                try:
+                    # Wait for engine writes before capturing selection and reading.
+                    async with self.app_ref._save_lock:
+                        if not self._active or generation != self._generation:
+                            continue
+                        prepared = self.prepare(self.app_ref) if self.prepare else None
+                        snapshot = await self.app_ref._run_save_io(self.collector, prepared)
+                    if self._active and generation == self._generation and not self._is_unmounted:
+                        self._collected_snapshot = snapshot
+                        self._apply_rendered_content(self._invoke_factory())
+                        self._dirty = False
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    LOGGER.exception("Custom view collection failed")
+                    if self._active and generation == self._generation and not self._is_unmounted:
+                        self._apply_rendered_content(Text(f"Error rendering custom view: {exc}", style="bold red"))
+                if not self._refresh_pending:
+                    break
+        finally:
+            self._refresh_inflight = False
+            self._refresh_task = None
+
     def _invoke_factory(self) -> Any:
         factory = self.renderable_or_factory
+        if self.collector is not None:
+            return factory(self._collected_snapshot)
         if not callable(factory):
             return factory
 
@@ -1882,17 +1923,46 @@ class CustomRichTabWidget(Static):
         return factory(self.app_ref) if self._factory_takes_app else factory()
 
     def update_content(self) -> None:
-        if self._refresh_inflight:
+        self.invalidate_content()
+        self._request_refresh()
+
+    def _request_refresh(self) -> None:
+        if not self._active or self._is_unmounted:
             return
-        self._refresh_inflight = True
+        self._generation += 1
+        if self.collector is not None:
+            self._refresh_pending = True
+            if self._refresh_task is None:
+                task = self._refresh_task = asyncio.create_task(self._async_refresh())
+                self.app_ref._custom_refresh_tasks.add(task)
+                task.add_done_callback(self.app_ref._custom_refresh_tasks.discard)
+            return
+        # Legacy factories execute on their owning UI thread.
         try:
             res = self._invoke_factory()
             if res is not None:
-                self.update(res)
-        except Exception as e:
-            self.update(Text(f"Error rendering custom view: {e}", style="bold red"))
-        finally:
-            self._refresh_inflight = False
+                self._apply_rendered_content(res)
+                self._dirty = False
+        except Exception as exc:
+            LOGGER.exception("Custom view rendering failed")
+            self._apply_rendered_content(Text(f"Error rendering custom view: {exc}", style="bold red"))
+
+    def _apply_rendered_content(self, res: Any) -> None:
+        if self._is_unmounted:
+            return
+
+        res_repr = repr(res)
+        self._last_rendered_repr = res_repr
+
+        parent = self.parent
+        saved_y = None
+        if isinstance(parent, VerticalScroll):
+            saved_y = parent.scroll_y
+
+        self.update(res)
+
+        if saved_y is not None and isinstance(parent, VerticalScroll) and saved_y > 0:
+            parent.scroll_to(y=saved_y, animate=False, immediate=True)
 
 
 class DuskyTUI(App):
@@ -1927,7 +1997,7 @@ Screen { background: $background; }
 
 .tab-arrow {
     width: 3; height: 1; content-align: center middle;
-    background: $background; color: $primary; text-style: bold; display: none;
+    background: $background; color: $primary; text-style: bold;
 }
 .tab-arrow:hover { color: $foreground; background: $primary 25%; }
 
@@ -1964,13 +2034,18 @@ NoticeBox.-danger { border-left: solid $error; background: $error 10%; }
 NoticeBox.-success { border-left: solid $success; background: $success 10%; }
 
 .list-wrapper { height: 1fr; }
+.custom-view-scroll { height: 1fr; overflow-x: hidden; overflow-y: auto; scrollbar-size: 1 1; }
+.custom-rich-content { height: auto; overflow: hidden hidden; }
+.custom-body { height: 1fr; }
+.custom-body-with-options { height: 2fr; min-height: 3; }
+.custom-options { height: 1fr; min-height: 3; }
 
 ConfigOptionList {
     min-width: 20; width: 1fr; height: 1fr; scrollbar-size: 0 0;
     background: transparent; border: none;
 }
 ConfigOptionList > .option-list--option {
-    padding: 0 1; background: transparent; transition: background 150ms linear;
+    padding: 0 1; background: transparent;
 }
 ConfigOptionList > .option-list--option-hover { background: $primary 10%; }
 ConfigOptionList > .option-list--option-highlighted { background: $primary 20%; }
@@ -2205,6 +2280,9 @@ Tooltip {
     ):
         super().__init__(**kwargs)
 
+        self.supports_smooth_scrolling = True
+        self.scroll_sensitivity_y = 2.0
+
         self.deferred_load = deferred_load
         self.hide_missing_items = hide_missing_items
         self.custom_views = custom_views or {}
@@ -2424,6 +2502,71 @@ Tooltip {
     # =========================================================================
     # COMPOSE
     # =========================================================================
+    def _custom_spec(self, tab_idx: int) -> Any:
+        spec = self.custom_views.get(tab_idx)
+        return self.custom_views.get(self.tabs.get(tab_idx)) if spec is None else spec
+
+    def _custom_body_widgets(self, tab_idx: int) -> list[Widget]:
+        spec = self._custom_spec(tab_idx)
+        settings = spec if isinstance(spec, dict) and "view" in spec else {}
+        view = settings.get("view", spec)
+        if isinstance(view, type) and issubclass(view, Widget):
+            return [view()]
+        if isinstance(view, Widget):
+            return [view]
+        rich_widget = CustomRichTabWidget(
+            view, app_ref=self, refresh_interval=settings.get("interval"),
+            collector=settings.get("collect"), prepare=settings.get("prepare"),
+            classes="custom-rich-content", id=f"custom-view-{tab_idx}",
+        )
+        rich_widget.can_focus = False
+        return [VerticalScroll(rich_widget, classes="custom-view-scroll", id=f"custom-scroll-{tab_idx}")]
+
+    def _notice_widgets(self, tab_idx: int, *, bottom: bool = False) -> list[Widget]:
+        notices = self.tab_notices.get(tab_idx, [])
+        if isinstance(notices, dict):
+            notices = [notices]
+        return [NoticeBox(notice.get("message", ""), level=notice.get("level", "info"),
+                          id=f"notice-{tab_idx}-{index}" + ("-bot" if bottom else ""))
+                for index, notice in enumerate(notices)
+                if (notice.get("position", "top") == "bottom") == bottom]
+
+    async def _ensure_custom_body(self, tab_idx: int) -> None:
+        if self._custom_spec(tab_idx) is None or tab_idx in self._mounted_tabs:
+            return
+        task = self._custom_mount_tasks.get(tab_idx)
+        if task is None:
+            async def mount_body():
+                nodes = []
+                try:
+                    host = self.query_one(f"#custom-body-{tab_idx}")
+                    body = self._custom_body_widgets(tab_idx)
+                    nodes.extend(body)
+                    await host.mount(*body)
+                    pane = self.query_one(f"#tab-{tab_idx}")
+                    if top := self._notice_widgets(tab_idx):
+                        nodes.extend(top)
+                        await pane.mount(*top, before=host)
+                    if bottom := self._notice_widgets(tab_idx, bottom=True):
+                        nodes.extend(bottom)
+                        await pane.mount(*bottom)
+                    self._mounted_tabs.add(tab_idx)
+                except BaseException:
+                    for node in nodes:
+                        if node.parent is not None:
+                            await node.remove()
+                    raise
+                finally:
+                    self._custom_mount_tasks.pop(tab_idx, None)
+            task = self._custom_mount_tasks[tab_idx] = asyncio.create_task(mount_body())
+        await asyncio.shield(task)
+
+    def _activate_custom_views(self) -> None:
+        current = self._current_tab_index()
+        for tab_idx in self._mounted_tabs:
+            for view in self.query_one(f"#custom-body-{tab_idx}").query(CustomRichTabWidget):
+                view.set_active(tab_idx == current and self._engines_for_tab(tab_idx).issubset(self._loaded_engines))
+
     def compose(self) -> ComposeResult:
         with Vertical(id="main-box"):
             with Horizontal(id="tab-bar"):
@@ -2444,52 +2587,26 @@ Tooltip {
                 with ContentSwitcher(initial=f"tab-{self._initial_tab}" if self._initial_tab is not None else None, id="content-switcher"):
                     for i, name in self.tabs.items():
                         with Vertical(id=f"tab-{i}"):
-                            tab_notices = self.tab_notices.get(i)
+                            custom_view = self._custom_spec(i)
+                            eager_notices = custom_view is None or i == self._initial_tab
+                            if eager_notices:
+                                yield from self._notice_widgets(i)
 
-                            if tab_notices:
-                                if isinstance(tab_notices, dict):
-                                    tab_notices = [tab_notices]
-
-                                for n_idx, tab_notice in enumerate(tab_notices):
-                                    if tab_notice.get("position", "top") != "bottom":
-                                        level = tab_notice.get("level", "info")
-                                        message = tab_notice.get("message", "")
-                                        yield NoticeBox(message, level=level, id=f"notice-{i}-{n_idx}")
-
-                            custom_view = self.custom_views.get(i)
-                            if custom_view is None:
-                                custom_view = self.custom_views.get(name)
-
+                            settings = custom_view if isinstance(custom_view, dict) else {}
                             if custom_view is not None:
-                                refresh_interval = None
-                                if isinstance(custom_view, dict) and "view" in custom_view:
-                                    refresh_interval = custom_view.get("interval")
-                                    custom_view = custom_view["view"]
-
-                                if isinstance(custom_view, type) and issubclass(custom_view, Widget):
-                                    yield custom_view()
-                                elif isinstance(custom_view, Widget):
-                                    yield custom_view
-                                else:
-                                    yield CustomRichTabWidget(
-                                        renderable_or_factory=custom_view,
-                                        app_ref=self,
-                                        refresh_interval=refresh_interval,
-                                        id=f"custom-view-{i}"
-                                    )
-                            else:
-                                with Horizontal(classes="list-wrapper"):
+                                initial = i == self._initial_tab
+                                body = self._custom_body_widgets(i) if initial else []
+                                if initial:
+                                    self._mounted_tabs.add(i)
+                                yield Vertical(*body, id=f"custom-body-{i}", classes="custom-body-with-options" if settings.get("show_options") else "custom-body")
+                            if custom_view is None or settings.get("show_options", False):
+                                with Horizontal(classes="list-wrapper custom-options" if custom_view is not None else "list-wrapper"):
                                     yield ConfigOptionList(id=f"list-{i}")
-
                                     with Vertical(classes="indicator-column"):
                                         yield ScrollIndicator("", id=f"indicator-{i}")
 
-                            if tab_notices:
-                                for n_idx, tab_notice in enumerate(tab_notices):
-                                    if tab_notice.get("position", "top") == "bottom":
-                                        level = tab_notice.get("level", "info")
-                                        message = tab_notice.get("message", "")
-                                        yield NoticeBox(message, level=level, id=f"notice-{i}-{n_idx}-bot")
+                            if eager_notices:
+                                yield from self._notice_widgets(i, bottom=True)
 
                 with Vertical(id="help-panel"):
                     yield Markdown("Select an item to view documentation.", id="help-markdown")
@@ -3283,14 +3400,17 @@ Tooltip {
         except Exception:
             pass
 
-        self.call_after_refresh(self.check_tab_overflow)
         self.run_deferred_boot(initial_tab=self._initial_tab)
 
         if first_ol := self.current_option_list:
             first_ol.focus()
             self._update_pagination(first_ol)
 
-        self.telemetry_engine = None
+        self.telemetry_engine = first_engine if hasattr(first_engine, "get_telemetry") else None
+        if self.telemetry_engine is not None:
+            banner = self.query_one("#telemetry-banner", Label)
+            banner.update("Loading telemetry…")
+            banner.display = True
 
         if self.theme_path:
             self.set_interval(1.0, self.watch_theme_file)
@@ -3331,7 +3451,10 @@ Tooltip {
         self._pending_engine_loads: set[tuple[str, str]] = set()
         self._failed_engines: dict[tuple[str, str], str] = {}
         self._mounted_tabs: set[int] = set()
-        self._populated_tabs: set[int] = set()
+        self._populated_tabs = self._tab_populated
+        self._custom_mount_tasks: dict[int, asyncio.Task] = {}
+        self._custom_refresh_tasks: set[asyncio.Task] = set()
+        self._pending_search_target: tuple[int, int] | None = None
         self._tab_data_ready: set[int] = set()
         self._boot_complete: bool = False
 
@@ -3349,6 +3472,8 @@ Tooltip {
 
     def _engines_for_tab(self, tab_idx: int) -> set[tuple[str, str]]:
         keys: set[tuple[str, str]] = set()
+        if self._custom_spec(tab_idx) is not None:
+            keys.add(self.default_engine_key)
         for item in self.schema.get(tab_idx, []):
             if item.type_ in ("action", "preset", "menu"):
                 continue
@@ -3572,21 +3697,23 @@ Tooltip {
             self._refresh_presets_ui()
 
     def _refresh_custom_views(self) -> None:
-        for tab_idx, name in self.tabs.items():
-            if tab_idx not in self.custom_views and name not in self.custom_views:
-                continue
-            container = self.query_one(f"#tab-{tab_idx}")
-            for view in container.children:
-                if isinstance(view, NoticeBox):
-                    continue
+        for tab_idx in self._mounted_tabs:
+            for view in self.query_one(f"#custom-body-{tab_idx}").children:
                 try:
-                    if callable(update := getattr(view, "update_content", None)):
-                        update()
-                    else:
-                        view.refresh()
+                    rich_views = list(view.query(CustomRichTabWidget))
+                    if isinstance(view, CustomRichTabWidget):
+                        rich_views.append(view)
+                    if rich_views:
+                        for rich_view in rich_views:
+                            rich_view.update_content()
+                    elif tab_idx == self._current_tab_index():
+                        if callable(update := getattr(view, "update_content", None)):
+                            update()
+                        else:
+                            view.refresh()
                 except Exception:
                     LOGGER.exception("Unable to refresh custom view in tab %s", tab_idx)
-                    self.notify_status(f"Could not refresh custom view in {name}.", level="error")
+                    self.notify_status(f"Could not refresh custom view in {self.tabs[tab_idx]}.", level="error")
 
     @work(exclusive=True, group="engine-boot", exit_on_error=False)
     async def run_deferred_boot(self, *, initial_tab: int | None = 0) -> None:
@@ -3616,6 +3743,7 @@ Tooltip {
             await asyncio.sleep(0)
             self._populate_option_list(initial_tab)
             self._populated_tabs.add(initial_tab)
+            self._activate_custom_views()
             self.call_after_refresh(self._queue_ready_tabs_for_warmup)
 
         if deferred:
@@ -3658,6 +3786,7 @@ Tooltip {
                 self._tab_dirty.discard(cur)
 
         self._mark_boot_complete_if_done()
+        self._activate_custom_views()
         self._queue_ready_tabs_for_warmup()
 
     def _queue_ready_tabs_for_warmup(self) -> None:
@@ -3722,160 +3851,206 @@ Tooltip {
     # TAB POPULATION / LAZY UI
     # =========================================================================
     def _populate_option_list(self, tab_idx: int, maintain_highlight_id: str | None = None) -> None:
-        try:
-            ol = self.query_one(f"#list-{tab_idx}", ConfigOptionList)
-        except Exception:
-            return
-
-        scroll_y = ol.scroll_y
-
-        if not maintain_highlight_id and ol.highlighted is not None:
+        with self.batch_update():
             try:
-                maintain_highlight_id = ol.get_option_at_index(ol.highlighted).id
-            except OptionDoesNotExist:
-                pass
-
-        items = self.schema.get(tab_idx, [])
-        # Schemas opt in to hiding missing settings. Other TUIs often show
-        # settings whose config file has no entry yet.
-        visible = {
-            idx for idx, item in enumerate(items)
-            if item.type_ in ("menu", "action", "preset")
-            or not self.hide_missing_items
-            or item.exists_in_target
-        }
-        for idx, item in enumerate(items):
-            if item.type_ == "menu" and self.hide_missing_items and not any(
-                child.parent_ref in (item.uid, item.key) and child_idx in visible
-                for child_idx, child in enumerate(items)
-            ):
-                visible.discard(idx)
-        options = []
-        current_group = None
-        first_item_id = None
-
-        parents = {itm.uid: idx for idx, itm in enumerate(items) if idx in visible and (itm.is_parent or itm.type_ == "menu")}
-        for idx, itm in enumerate(items):
-            if idx in visible and (itm.is_parent or itm.type_ == "menu"):
-                parents.setdefault(itm.key, idx)
-        children_map = defaultdict(list)
-        root_items = []
-        parent_indices = {
-            idx: parents[itm.parent_ref]
-            for idx, itm in enumerate(items)
-            if idx in visible and itm.parent_ref in parents and parents[itm.parent_ref] != idx
-        }
-        # Break malformed cycles so every tree has a visible root.
-        checked = set()
-        for start in tuple(parent_indices):
-            chain = set()
-            current = start
-            while current in parent_indices and current not in checked:
-                if current in chain:
-                    del parent_indices[current]
-                    break
-                chain.add(current)
-                current = parent_indices[current]
-            checked.update(chain)
-        for orig_idx, itm in enumerate(items):
-            if orig_idx not in visible:
-                continue
-            if orig_idx in parent_indices:
-                children_map[parent_indices[orig_idx]].append((orig_idx, itm))
-            else:
-                root_items.append((orig_idx, itm))
-
-        # Clear only this tab's indent cache entries.
-        prefix_key = f"item_{tab_idx}_"
-        self._indent_cache = {
-            k: v for k, v in self._indent_cache.items()
-            if not k.startswith(prefix_key)
-        }
-
-        visited: set[int] = set()
-        stack = [(idx, itm, [i == len(root_items) - 1]) for i, (idx, itm) in reversed(list(enumerate(root_items)))]
-
-        def traverse(node_idx: int, node_item: ConfigItem, is_last_sibling_list: list[bool]):
-            nonlocal current_group, first_item_id
-            if node_idx in visited:
+                ol = self.query_one(f"#list-{tab_idx}", ConfigOptionList)
+            except Exception:
                 return
-            visited.add(node_idx)
 
-            if node_item.group and node_item.group != current_group:
-                current_group = node_item.group
-                header_txt = Text(f" {current_group.upper()}", style=f"bold {self.theme_colors['accent']}")
-                options.append(Option(header_txt, id=f"header_{tab_idx}_{node_idx}", disabled=True))
+            scroll_y = ol.scroll_y
+            old_keys = getattr(ol, "_rendered_option_keys", {})
 
-            opt_id = f"item_{tab_idx}_{node_idx}"
+            if not maintain_highlight_id and ol.highlighted is not None:
+                try:
+                    maintain_highlight_id = ol.get_option_at_index(ol.highlighted).id
+                except OptionDoesNotExist:
+                    pass
 
-            if first_item_id is None:
-                first_item_id = opt_id
-
-            is_hl = (
-                (maintain_highlight_id == opt_id)
-                if maintain_highlight_id
-                else first_item_id == opt_id
-            )
-
-            prefix = ""
-            depth = len(is_last_sibling_list) - 1
-
-            if depth > 0:
-                prefix = "  "
-                for is_last in is_last_sibling_list[1:-1]:
-                    prefix += "  " if is_last else "│ "
-                prefix += "└─" if is_last_sibling_list[-1] else "├─"
-
-            self._indent_cache[opt_id] = prefix
-
-            options.append(
-                Option(
-                    self._build_option(node_item, is_highlighted=is_hl, indent_prefix=prefix, tab_idx=tab_idx),
-                    id=opt_id
+            items = self.schema.get(tab_idx, [])
+            option_keys = {
+                f"item_{tab_idx}_{idx}": (item.scope, item.key, item.parent_ref)
+                for idx, item in enumerate(items)
+            }
+            selected_key = old_keys.get(maintain_highlight_id) if maintain_highlight_id else None
+            if selected_key is None and ol.highlighted is not None:
+                try:
+                    selected_key = old_keys.get(ol.get_option_at_index(ol.highlighted).id)
+                except OptionDoesNotExist:
+                    pass
+            # Schemas opt in to hiding missing settings. Other TUIs often show
+            # settings whose config file has no entry yet.
+            visible = {
+                idx for idx, item in enumerate(items)
+                if (
+                    not isinstance(self.custom_views.get(tab_idx), dict)
+                    or not self.custom_views[tab_idx].get("option_groups")
+                    or item.group in self.custom_views[tab_idx]["option_groups"]
+                ) and (
+                    item.type_ in ("menu", "action", "preset")
+                    or not self.hide_missing_items
+                    or item.exists_in_target
                 )
+            }
+            for idx, item in enumerate(items):
+                if item.type_ == "menu" and self.hide_missing_items and not any(
+                    child.parent_ref in (item.uid, item.key) and child_idx in visible
+                    for child_idx, child in enumerate(items)
+                ):
+                    visible.discard(idx)
+            options = []
+            current_group = None
+            first_item_id = None
+
+            parents = {itm.uid: idx for idx, itm in enumerate(items) if idx in visible and (itm.is_parent or itm.type_ == "menu")}
+            for idx, itm in enumerate(items):
+                if idx in visible and (itm.is_parent or itm.type_ == "menu"):
+                    parents.setdefault(itm.key, idx)
+            children_map = defaultdict(list)
+            root_items = []
+            parent_indices = {
+                idx: parents[itm.parent_ref]
+                for idx, itm in enumerate(items)
+                if idx in visible and itm.parent_ref in parents and parents[itm.parent_ref] != idx
+            }
+            # Break malformed cycles so every tree has a visible root.
+            checked = set()
+            for start in tuple(parent_indices):
+                chain = set()
+                current = start
+                while current in parent_indices and current not in checked:
+                    if current in chain:
+                        del parent_indices[current]
+                        break
+                    chain.add(current)
+                    current = parent_indices[current]
+                checked.update(chain)
+            for orig_idx, itm in enumerate(items):
+                if orig_idx not in visible:
+                    continue
+                if orig_idx in parent_indices:
+                    children_map[parent_indices[orig_idx]].append((orig_idx, itm))
+                else:
+                    root_items.append((orig_idx, itm))
+
+            # Clear only this tab's indent cache entries.
+            prefix_key = f"item_{tab_idx}_"
+            self._indent_cache = {
+                k: v for k, v in self._indent_cache.items()
+                if not k.startswith(prefix_key)
+            }
+
+            visited: set[int] = set()
+            stack = [(idx, itm, [i == len(root_items) - 1]) for i, (idx, itm) in reversed(list(enumerate(root_items)))]
+
+            def traverse(node_idx: int, node_item: ConfigItem, is_last_sibling_list: list[bool]):
+                nonlocal current_group, first_item_id
+                if node_idx in visited:
+                    return
+                visited.add(node_idx)
+
+                if node_item.group and node_item.group != current_group:
+                    current_group = node_item.group
+                    header_txt = Text(f" {current_group.upper()}", style=f"bold {self.theme_colors['accent']}")
+                    options.append(Option(header_txt, id=f"header_{tab_idx}_{node_idx}", disabled=True))
+
+                opt_id = f"item_{tab_idx}_{node_idx}"
+
+                if first_item_id is None:
+                    first_item_id = opt_id
+
+                is_hl = (
+                    (maintain_highlight_id == opt_id)
+                    if maintain_highlight_id
+                    else first_item_id == opt_id
+                )
+
+                prefix = ""
+                depth = len(is_last_sibling_list) - 1
+
+                if depth > 0:
+                    prefix = "  "
+                    for is_last in is_last_sibling_list[1:-1]:
+                        prefix += "  " if is_last else "│ "
+                    prefix += "└─" if is_last_sibling_list[-1] else "├─"
+
+                self._indent_cache[opt_id] = prefix
+
+                options.append(
+                    Option(
+                        self._build_option(node_item, is_highlighted=is_hl, indent_prefix=prefix, tab_idx=tab_idx),
+                        id=opt_id
+                    )
+                )
+
+                if (node_item.is_parent or node_item.type_ == "menu") and node_item.expanded:
+                    children = children_map.get(node_idx, [])
+
+                    for i, (child_idx, child_item) in reversed(list(enumerate(children))):
+                        is_last = (i == len(children) - 1)
+                        stack.append((child_idx, child_item, is_last_sibling_list + [is_last]))
+
+            while stack:
+                traverse(*stack.pop())
+
+            old_options = list(ol.options)
+            if selected_key is not None:
+                visible_ids = {option_keys[option.id]: option.id for option in options if not option.disabled}
+                maintain_highlight_id = visible_ids.get(selected_key)
+                if maintain_highlight_id is None and selected_key[2]:
+                    parent = next((item for item in items if item.uid == selected_key[2] or item.key == selected_key[2]), None)
+                    if parent is not None:
+                        maintain_highlight_id = visible_ids.get((parent.scope, parent.key, parent.parent_ref))
+                if maintain_highlight_id is None:
+                    previous_index = ol.highlighted or 0
+                    neighbors = sorted(enumerate(old_options), key=lambda pair: abs(pair[0] - previous_index))
+                    maintain_highlight_id = next((visible_ids[old_keys[option.id]] for _, option in neighbors
+                                                  if old_keys.get(option.id) in visible_ids), first_item_id)
+
+            same_structure = (
+                len(old_options) == len(options)
+                and all(old.id == new.id and old_keys.get(old.id) == option_keys.get(new.id)
+                        for old, new in zip(old_options, options))
             )
+            if same_structure:
+                for index, (old, new) in enumerate(zip(old_options, options)):
+                    if old.prompt != new.prompt:
+                        ol.replace_option_prompt_at_index(index, new.prompt)
+            else:
+                ol._restoring_options = True
+                try:
+                    ol.clear_options()
+                    ol.add_options(options)
+                    if maintain_highlight_id:
+                        try:
+                            ol.highlighted = ol.get_option_index(maintain_highlight_id)
+                        except OptionDoesNotExist:
+                            ol.highlighted = ol.get_option_index(first_item_id) if first_item_id else None
+                    elif first_item_id:
+                        ol.highlighted = ol.get_option_index(first_item_id)
+                    ol.last_highlighted_id = (
+                        ol.get_option_at_index(ol.highlighted).id if ol.highlighted is not None else None
+                    )
+                    ol.scroll_y = scroll_y
+                finally:
+                    ol._restoring_options = False
 
-            if (node_item.is_parent or node_item.type_ == "menu") and node_item.expanded:
-                children = children_map.get(node_idx, [])
+            positions = []
+            count = 0
+            for option in options:
+                count += not option.disabled
+                positions.append(count)
+            ol._selectable_positions = positions
 
-                for i, (child_idx, child_item) in reversed(list(enumerate(children))):
-                    is_last = (i == len(children) - 1)
-                    stack.append((child_idx, child_item, is_last_sibling_list + [is_last]))
+            ol._rendered_option_keys = option_keys
 
-        while stack:
-            traverse(*stack.pop())
+            self._tab_populated.add(tab_idx)
+            self._tab_dirty.discard(tab_idx)
 
-        ol.clear_options()
-        ol.add_options(options)
-        positions = []
-        count = 0
-        for option in options:
-            count += not option.disabled
-            positions.append(count)
-        ol._selectable_positions = positions
+            if tab_idx == self._current_tab_index():
+                self._update_file_link()
+                self._update_current_help_panel()
 
-        if maintain_highlight_id:
-            try:
-                ol.highlighted = ol.get_option_index(maintain_highlight_id)
-            except OptionDoesNotExist:
-                ol.highlighted = ol.get_option_index(first_item_id) if first_item_id else None
-
-        elif first_item_id:
-            ol.last_highlighted_id = first_item_id
-            try:
-                ol.highlighted = ol.get_option_index(first_item_id)
-            except OptionDoesNotExist:
-                pass
-
-        ol.scroll_y = scroll_y
-
-        self._tab_populated.add(tab_idx)
-        self._tab_dirty.discard(tab_idx)
-
-        if tab_idx == self._current_tab_index():
-            self._update_file_link()
-
-        self.call_after_refresh(self._update_scroll_indicators)
+            self.call_after_refresh(self._update_scroll_indicators)
 
     def _apply_deferred_tabs(
         self,
@@ -3993,6 +4168,84 @@ Tooltip {
                 self._update_pagination(ol)
         self._queue_ready_tabs_for_warmup()
 
+    def _replace_dynamic_tabs(self, replacements: dict[int, list[ConfigItem]]) -> bool:
+        """Reconcile a live inventory without invalidating edits and callbacks."""
+        if self._save_tasks or self._save_timers or self._save_auth_pending or self._modal_active():
+            return False
+
+        remapped: dict[tuple[int, int], tuple[int, int]] = {}
+        observed: dict[tuple[int, int], Any] = {}
+        changed = False
+        for tab_idx, incoming in replacements.items():
+            existing = self.schema.get(tab_idx, [])
+            old_by_identity = defaultdict(deque)
+            for old_idx, item in enumerate(existing):
+                old_by_identity[(item.scope, item.key, item.parent_ref)].append((old_idx, item))
+
+            merged = []
+            for new_idx, fresh in enumerate(incoming):
+                matches = old_by_identity.get((fresh.scope, fresh.key, fresh.parent_ref))
+                if not matches:
+                    merged.append(fresh)
+                    changed = True
+                    continue
+                old_idx, item = matches.popleft()
+                remapped[(tab_idx, old_idx)] = (tab_idx, new_idx)
+                if old_idx != new_idx:
+                    changed = True
+                pending = (tab_idx, old_idx) in self.pending_commits
+                if not pending:
+                    item.value = clone_value(fresh.value)
+                    item.initial_value = clone_value(fresh.initial_value)
+                    item._initial_loaded = fresh._initial_loaded
+                    item.exists_in_target = fresh.exists_in_target
+                    observed[(tab_idx, new_idx)] = clone_value(fresh.value)
+                item.label = fresh.label
+                item.default = clone_value(fresh.default)
+                item.options = list(fresh.options)
+                item.hints = list(fresh.hints)
+                item.group = fresh.group
+                item.extended_help = fresh.extended_help
+                item.confirm_message = fresh.confirm_message
+                item.warning_msg = fresh.warning_msg
+                item.popup_message = fresh.popup_message
+                item.read_only = fresh.read_only
+                item.expanded = item.expanded if item.is_parent else fresh.expanded
+                merged.append(item)
+
+            if any(old_by_identity.values()):
+                changed = True
+            self.schema[tab_idx] = merged
+
+        replaced_tabs = set(replacements)
+
+        def remap(ref):
+            return remapped.get(ref) if ref[0] in replaced_tabs else ref
+
+        self._committed = {
+            new_ref: value for ref, value in self._committed.items()
+            if (new_ref := remap(ref)) is not None
+        }
+        self._committed.update(observed)
+        for tab_idx, incoming in replacements.items():
+            for idx, item in enumerate(self.schema[tab_idx]):
+                self._committed.setdefault((tab_idx, idx), clone_value(item.value))
+        self.pending_commits = {
+            new_ref for ref in self.pending_commits
+            if (new_ref := remap(ref)) is not None
+        }
+        for history in (self.undo_stack, self.redo_stack):
+            transactions = [
+                [(*new_ref, old, new) for ti, ii, old, new in transaction
+                 if (new_ref := remap((ti, ii))) is not None]
+                for transaction in history
+            ]
+            history.clear()
+            history.extend(transaction for transaction in transactions if transaction)
+        if changed:
+            self._schema_dirty_counter += 1
+        return True
+
     def _refresh_single_ui(self, tab_idx: int, item_idx: int, item: ConfigItem) -> None:
         if tab_idx not in self._tab_populated:
             self._tab_dirty.add(tab_idx)
@@ -4083,7 +4336,6 @@ Tooltip {
         try:
             self.query_one("#shortcut-ctrl-s").display = not new
             self.query_one("#shortcut-R").display = new
-            self.call_after_refresh(self.query_one("#footer-shortcuts-container", FlowContainer).reflow)
         except Exception:
             pass
 
@@ -4161,22 +4413,16 @@ Tooltip {
             cont_w = container.size.width
 
             if bar_w > 0 and tabs_w > 0:
-                has_overflow = (tabs_w > bar_w) or (left.display and tabs_w > cont_w)
+                has_overflow = tabs_w > cont_w
             else:
                 has_overflow = container.max_scroll_x > 0
 
             if has_overflow:
-                if not left.display:
-                    left.display = True
-                    right.display = True
                 left.update(" ◀ " if container.scroll_x > 0.5 else "   ")
                 right.update(" ▶ " if container.scroll_x < (container.max_scroll_x - 0.5) else "   ")
                 if container.styles.align != ("left", "middle"):
                     container.styles.align = ("left", "middle")
             else:
-                if left.display:
-                    left.display = False
-                    right.display = False
                 left.update("")
                 right.update("")
                 if container.scroll_x > 0:
@@ -4515,48 +4761,61 @@ Tooltip {
     # TAB HANDLING
     # =========================================================================
     @on(Tabs.TabActivated)
-    def handle_tab_activated(self, event: Tabs.TabActivated) -> None:
+    async def handle_tab_activated(self, event: Tabs.TabActivated) -> None:
         try:
             idx = int(event.tab.id.split("-")[-1])
-            self.query_one(ContentSwitcher).current = f"tab-{idx}"
-            self.scroll_tab_into_view(event.tab)
+            await self._ensure_custom_body(idx)
+            if self.query_one(Tabs).active != event.tab.id:
+                return
+            with self.batch_update():
+                self.query_one(ContentSwitcher).current = f"tab-{idx}"
+                self._activate_custom_views()
+                self.scroll_tab_into_view(event.tab)
 
-            if idx not in self._tab_data_ready and self._engines_for_tab(idx).issubset(self._loaded_engines):
-                self._apply_states_to_tab(idx, self._states)
+                if idx not in self._tab_data_ready and self._engines_for_tab(idx).issubset(self._loaded_engines):
+                    self._apply_states_to_tab(idx, self._states)
 
-            if idx not in self._populated_tabs or idx in self._tab_dirty:
-                self._populate_option_list(idx)
-                self._populated_tabs.add(idx)
-                self._tab_dirty.discard(idx)
+                if idx not in self._populated_tabs or idx in self._tab_dirty:
+                    self._populate_option_list(idx)
+                    self._populated_tabs.add(idx)
+                    self._tab_dirty.discard(idx)
 
-            if ol := self.current_option_list:
-                ol.focus()
+                if ol := self.current_option_list:
+                    ol.focus()
 
-                if ol.highlighted is None and ol.option_count > 0:
-                    for i in range(ol.option_count):
-                        opt = ol.get_option_at_index(i)
-                        if not getattr(opt, "disabled", False):
-                            ol.highlighted = i
-                            break
+                    if ol.highlighted is None and ol.option_count > 0:
+                        for i in range(ol.option_count):
+                            opt = ol.get_option_at_index(i)
+                            if not getattr(opt, "disabled", False):
+                                ol.highlighted = i
+                                break
 
-                self._update_pagination(ol)
-            else:
-                try:
-                    for cw in self.query(CustomRichTabWidget):
-                        if cw.display:
-                            cw.focus()
-                            break
-                except Exception:
-                    pass
+                    self._update_pagination(ol)
+                else:
+                    try:
+                        host = self.query_one(f"#custom-body-{idx}")
+                        for view in host.children:
+                            if not view.query(CustomRichTabWidget) and not isinstance(view, CustomRichTabWidget):
+                                if callable(update := getattr(view, "update_content", None)):
+                                    update()
+                        for widget in host.query(Widget):
+                            if widget.can_focus and not widget.disabled:
+                                widget.focus()
+                                break
+                    except Exception:
+                        pass
 
-                self._update_pagination(None)
+                    self._update_pagination(None)
 
-            self._update_scroll_indicators()
-            self.check_tab_overflow()
-            self._update_file_link()
+                self._focus_search_target()
+                self._update_scroll_indicators()
+                self.check_tab_overflow()
+                self._update_file_link()
+                self._update_current_help_panel()
 
         except Exception:
-            pass
+            LOGGER.exception("Unable to activate tab")
+            self.notify_status("Unable to open tab.", level="error")
 
     @on(events.Click, "#tab-left")
     def scroll_tabs_left(self, event: events.Click) -> None:
@@ -4619,11 +4878,31 @@ Tooltip {
                 if item.warning_msg:
                     help_text += f"> **{_ICON_WARNING} WARNING:** {item.warning_msg}\n"
 
-                help_text += item.extended_help or f"**{item.label}**\nNo extended documentation available."
+                help_text += item.extended_help or f"**{_md_escape(item.label)}**\nNo extended documentation available."
 
-                md.update(help_text)
+                if getattr(md, "_dusky_help_text", None) != help_text:
+                    md.update(help_text)
+                    md._dusky_help_text = help_text
 
         except Exception:
+            pass
+
+    def _update_current_help_panel(self) -> None:
+        try:
+            if not self.query_one("#content-area").has_class("-show-help"):
+                return
+            ol = self.current_option_list
+            if ol and ol.highlighted is not None:
+                parsed = self._get_item_from_id(ol.get_option_at_index(ol.highlighted).id)
+                if parsed:
+                    self._update_help_panel(parsed[2])
+                    return
+            md = self.query_one("#help-markdown", Markdown)
+            neutral = "Select an item to view documentation."
+            if getattr(md, "_dusky_help_text", None) != neutral:
+                md.update(neutral)
+                md._dusky_help_text = neutral
+        except (NoMatches, OptionDoesNotExist):
             pass
 
     @on(OptionList.OptionHighlighted)
@@ -4631,6 +4910,19 @@ Tooltip {
         ol = event.option_list
 
         if not isinstance(ol, ConfigOptionList) or not event.option_id:
+            return
+
+        restored = getattr(ol, "_restored_option", None) is event.option
+        if restored:
+            ol._restored_option = None
+
+        try:
+            if (
+                ol is not self.current_option_list or ol.highlighted != event.option_index
+                or ol.get_option_at_index(event.option_index) is not event.option
+            ):
+                return
+        except OptionDoesNotExist:
             return
 
         parsed = self._get_item_from_id(event.option_id)
@@ -4667,12 +4959,12 @@ Tooltip {
 
                 ol.last_highlighted_id = event.option_id
 
-                if hasattr(ol, "scroll_to_highlight"):
-                    ol.scroll_to_highlight()
-                elif hasattr(ol, "scroll_to_option") and curr_idx is not None:
-                    ol.scroll_to_option(curr_idx)
-
-                self._ensure_header_visible(ol, curr_idx)
+                if not restored:
+                    if hasattr(ol, "scroll_to_highlight"):
+                        ol.scroll_to_highlight()
+                    elif hasattr(ol, "scroll_to_option") and curr_idx is not None:
+                        ol.scroll_to_option(curr_idx)
+                    self._ensure_header_visible(ol, curr_idx)
 
             except OptionDoesNotExist:
                 pass
@@ -4683,26 +4975,13 @@ Tooltip {
         if ol is None or curr_idx is None or ol.option_count == 0:
             return
 
-        has_selectable_above = False
-        for i in range(curr_idx):
-            try:
-                if not getattr(ol.get_option_at_index(i), "disabled", False):
-                    has_selectable_above = True
-                    break
-            except Exception:
-                pass
-
-        if not has_selectable_above:
-            ol.scroll_y = 0
-            return
-
-        if curr_idx > 0:
+        # Only adjust if the option is at the very top of the visible window
+        # and has an immediate disabled group header 1 row above it
+        if curr_idx > 0 and int(ol.scroll_y) == curr_idx:
             try:
                 prev_opt = ol.get_option_at_index(curr_idx - 1)
                 if getattr(prev_opt, "disabled", False):
-                    target_header_idx = curr_idx - 1
-                    if int(ol.scroll_y) > target_header_idx:
-                        ol.scroll_y = target_header_idx
+                    ol.scroll_y = curr_idx - 1
             except Exception:
                 pass
 
@@ -4811,6 +5090,9 @@ Tooltip {
     def _bump_write_generation(self, uid: str) -> int:
         gen = self._write_generation.get(uid, 0) + 1
         self._write_generation[uid] = gen
+        if self.custom_views and self.is_mounted:
+            for view in self.query(CustomRichTabWidget):
+                view.invalidate_content()
         return gen
 
     def _bump_write_generation_for_item(self, item: ConfigItem) -> int:
@@ -5375,7 +5657,8 @@ Tooltip {
 
                 self.set_timer(0.15, reset_trigger)
 
-            self.notify_status(f"Updated {item.label}", level="success")
+            message = msg if self._get_item_engine_info(item)[0] == "network" and msg else f"Updated {item.label}"
+            self.notify_status(message, level="success")
             self._maybe_finish_quit()
             return
 
@@ -5893,12 +6176,7 @@ Tooltip {
         self.toggle_shortcut_active("help", content_area.has_class("-show-help"))
 
         if content_area.has_class("-show-help"):
-            ol = self.current_option_list
-
-            if ol and ol.last_highlighted_id:
-                parsed = self._get_item_from_id(ol.last_highlighted_id)
-                if parsed:
-                    self._update_help_panel(parsed[2])
+            self._update_current_help_panel()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "clear_local_search":
@@ -6019,6 +6297,22 @@ Tooltip {
         event.stop()
         self.action_clear_local_search()
 
+    def _focus_search_target(self) -> None:
+        target = self._pending_search_target
+        if target is None or self._current_tab_index() != target[0]:
+            return
+        tab_idx, item_idx = target
+        try:
+            ol = self.query_one(f"#list-{tab_idx}", ConfigOptionList)
+            ol.highlighted = ol.get_option_index(f"item_{tab_idx}_{item_idx}")
+            ol.focus()
+            ol.scroll_to_highlight()
+        except (NoMatches, OptionDoesNotExist):
+            LOGGER.exception("Unable to focus search result")
+            self.notify_status("Search result is no longer available.", level="warning")
+        finally:
+            self._pending_search_target = None
+
     def action_search(self) -> None:
         if isinstance(self.screen, SearchScreen):
             self.screen.dismiss(None)
@@ -6052,24 +6346,12 @@ Tooltip {
                         else:
                             break
 
+                self._pending_search_target = (tab_idx, item_idx)
                 self._populate_option_list(tab_idx, maintain_highlight_id=f"item_{tab_idx}_{item_idx}")
                 self.action_switch_tab(tab_idx)
-
-                def _focus_and_highlight():
-                    try:
-                        ol = self.query_one(f"#list-{tab_idx}", ConfigOptionList)
-                        ol.focus()
-
-                        idx = ol.get_option_index(f"item_{tab_idx}_{item_idx}")
-                        ol.highlighted = idx
-
-                        if hasattr(ol, "scroll_to_highlight"):
-                            ol.scroll_to_highlight()
-
-                    except Exception:
-                        pass
-
-                self.call_after_refresh(_focus_and_highlight)
+                # Same-tab searches need no activation event. Other searches
+                # are focused by handle_tab_activated after lazy mount completes.
+                self.call_after_refresh(self._focus_search_target)
 
         self.push_screen(SearchScreen(), check_reply)
 
@@ -6527,7 +6809,12 @@ Tooltip {
     def handle_selection(self, event: OptionList.OptionSelected) -> None:
         ol = event.option_list
 
-        if isinstance(ol, ConfigOptionList):
+        if isinstance(ol, ConfigOptionList) and ol is self.current_option_list:
+            try:
+                if ol.get_option_at_index(event.option_index) is not event.option:
+                    return
+            except OptionDoesNotExist:
+                return
             click_x = getattr(ol, "_last_click_x", 0)
             button = getattr(ol, "_last_click_button", 1)
             was_already_selected = getattr(ol, "_mouse_down_highlight", None) == event.option_index
@@ -7081,9 +7368,24 @@ Tooltip {
         if self._sudo_keepalive:
             self._sudo_keepalive.stop()
             self._sudo_keepalive = None
+        # Blocking collectors drain before engine resources are shut down.
+        tasks = list(self._custom_refresh_tasks) + list(self._custom_mount_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        engines = (
+            dict.values(self.engine_pool) if isinstance(self.engine_pool, dict)
+            else self.engine_pool.values()
+        )
+        for engine in engines:
+            if callable(shutdown := getattr(engine, "shutdown", None)):
+                shutdown()
         await self._shutdown_background_actions()
 
     def execute_action(self, item: ConfigItem) -> None:
+        if item.read_only:
+            return
         if item.key == "__save_new_preset":
             self.action_save_preset()
             return
